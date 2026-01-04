@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>High-Speed Rack Oscilloscope</title>
+    <style>
+        body { 
+            background: #111; color: #00ff00; font-family: 'Courier New', monospace; 
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            height: 100vh; margin: 0;
+        }
+
+        .screen-frame {
+            position: relative; background: #000; border: 12px solid #444;
+            box-shadow: inset 0 0 40px #003300, 0 15px 35px rgba(0,0,0,0.9);
+            overflow: hidden; transition: all 0.5s ease-in-out;
+            display: flex; align-items: center; justify-content: center;
+        }
+
+        .shape-rect   { border-radius: 8px; width: 850px; height: 450px; }
+        .shape-square { border-radius: 8px; width: 500px; height: 500px; }
+        .shape-circle { border-radius: 50%; width: 500px; height: 500px; }
+
+        canvas { width: 100%; height: 100%; }
+
+        .rack { 
+            background: #222; padding: 20px; border-radius: 10px; display: grid;
+            grid-template-columns: repeat(5, 1fr); gap: 12px;
+            margin-top: 20px; border: 4px solid #333; width: 950px;
+        }
+
+        .knob-group { 
+            display: flex; flex-direction: column; align-items: center; 
+            background: #1a1a1a; padding: 12px; border-radius: 6px; border: 1px solid #444;
+        }
+        
+        input[type=range] { width: 100%; accent-color: #00ff00; cursor: pointer; }
+        select, button { background: #000; color: #00ff00; border: 1px solid #00ff00; padding: 6px; cursor: pointer; width: 100%; font-family: inherit; font-size: 0.7rem; }
+        label { font-size: 0.65rem; text-transform: uppercase; color: #777; margin-bottom: 8px; font-weight: bold; }
+        .status-light { width: 8px; height: 8px; border-radius: 50%; background: #400; margin-bottom: 5px; }
+        .active-light { background: #f00; box-shadow: 0 0 10px #f00; }
+    </style>
+</head>
+<body>
+
+    <div id="chassis" class="screen-frame shape-rect">
+        <canvas id="scope"></canvas>
+    </div>
+
+    <div class="rack">
+        <div class="knob-group">
+            <label>System</label>
+            <div id="pwrLight" class="status-light"></div>
+            <button id="powerBtn">POWER OFF</button>
+            <label style="margin-top:10px">Frame</label>
+            <select id="screenShape">
+                <option value="shape-rect">Rect</option>
+                <option value="shape-square">Square</option>
+                <option value="shape-circle">Circle</option>
+            </select>
+        </div>
+
+        <div class="knob-group">
+            <label>Waveform</label>
+            <select id="waveType">
+                <option value="sine">Sine</option>
+                <option value="square">Square</option>
+                <option value="sawtooth">Saw</option>
+                <option value="triangle">Tri</option>
+            </select>
+            <label style="margin-top:10px">Freq (Hz)</label>
+            <input type="range" id="freq" min="10" max="1500" value="440">
+        </div>
+
+        <div class="knob-group">
+            <label>V-Scale</label>
+            <input type="range" id="gainKnob" min="0.1" max="3" step="0.1" value="1">
+            <label style="margin-top:10px">V-Pos</label>
+            <input type="range" id="yOffset" min="-200" max="200" value="0">
+        </div>
+
+        <div class="knob-group">
+            <label>H-Zoom</label>
+            <input type="range" id="timebase" min="0.5" max="20" step="0.5" value="2">
+            <label style="margin-top:10px">Sweep Speed</label>
+            <input type="range" id="sweepSpeed" min="1" max="120" value="60">
+        </div>
+
+        <div class="knob-group">
+            <label>Display</label>
+            <button id="toggleGrid">GRID: ON</button>
+            <label style="margin-top:10px">Phosphor</label>
+            <input type="range" id="trail" min="0.05" max="1" step="0.05" value="0.2">
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('scope');
+        const ctx = canvas.getContext('2d');
+        const chassis = document.getElementById('chassis');
+        
+        let audioCtx, osc, analyser;
+        let isPlaying = false;
+        let showNumbers = true;
+        let lastDrawTime = 0;
+
+        function resize() {
+            canvas.width = chassis.clientWidth;
+            canvas.height = chassis.clientHeight;
+        }
+        window.addEventListener('resize', () => setTimeout(resize, 550));
+        resize();
+
+        function drawGrid() {
+            const step = 50;
+            ctx.strokeStyle = '#002200';
+            ctx.fillStyle = '#006600';
+            ctx.font = '10px Courier New';
+
+            for (let x = 0; x <= canvas.width; x += step) {
+                ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+                if(showNumbers) ctx.fillText(x, x + 2, canvas.height - 5);
+            }
+            for (let y = 0; y <= canvas.height; y += step) {
+                ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+                if(showNumbers) ctx.fillText(((canvas.height/2-y)/10).toFixed(0)+"V", 5, y - 2);
+            }
+        }
+
+        function draw(timestamp) {
+            requestAnimationFrame(draw);
+            if(!isPlaying) return;
+
+            // CONTROL SWEEP SPEED (Frame Rate)
+            const targetFPS = document.getElementById('sweepSpeed').value;
+            const interval = 1000 / targetFPS;
+            const delta = timestamp - lastDrawTime;
+            if (delta < interval) return;
+            lastDrawTime = timestamp;
+
+            const trailVal = document.getElementById('trail').value;
+            ctx.fillStyle = `rgba(0, 0, 0, ${trailVal})`;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            drawGrid();
+
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            analyser.getByteTimeDomainData(dataArray);
+
+            const gain = document.getElementById('gainKnob').value;
+            const yOff = parseInt(document.getElementById('yOffset').value);
+            const zoom = document.getElementById('timebase').value;
+
+            ctx.strokeStyle = '#00ff00';
+            ctx.lineWidth = 3;
+            ctx.shadowBlur = 10;
+            ctx.shadowColor = '#00ff00';
+            ctx.beginPath();
+
+            let sliceWidth = (canvas.width / bufferLength) * zoom;
+            let x = 0;
+            for(let i = 0; i < bufferLength; i++) {
+                let v = (dataArray[i] / 128.0) - 1;
+                let y = (v * gain * (canvas.height / 2)) + (canvas.height / 2) + yOff;
+                if(i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+                x += sliceWidth;
+                if (x > canvas.width) break;
+            }
+            ctx.stroke();
+        }
+
+        // INPUT BINDINGS
+        document.getElementById('screenShape').onchange = function() {
+            chassis.className = 'screen-frame ' + this.value;
+            setTimeout(resize, 550);
+        };
+        document.getElementById('waveType').onchange = function() { if(osc) osc.type = this.value; };
+        document.getElementById('freq').oninput = function() { if(osc) osc.frequency.setTargetAtTime(this.value, audioCtx.currentTime, 0.03); };
+        document.getElementById('toggleGrid').onclick = function() { showNumbers = !showNumbers; this.innerText = showNumbers ? "GRID: ON" : "GRID: OFF"; };
+
+        document.getElementById('powerBtn').onclick = function() {
+            if(!isPlaying) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                osc = audioCtx.createOscillator();
+                analyser = audioCtx.createAnalyser();
+                osc.type = document.getElementById('waveType').value;
+                osc.connect(analyser); analyser.connect(audioCtx.destination);
+                osc.start();
+                this.innerText = "POWER ON";
+                document.getElementById('pwrLight').classList.add('active-light');
+                isPlaying = true;
+                draw();
+            }
+        };
+    </script>
+</body>
+</html>
